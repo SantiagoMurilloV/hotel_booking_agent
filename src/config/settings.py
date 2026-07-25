@@ -67,6 +67,10 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_KEY_PATH = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_KEY_PATH", str(PROJECT_ROOT / "service-account.json"))
 
+# Hotel fact sheets (rates, rooms, policies, upsells): when set, they are read
+# from this Google Sheet instead of src/data/hotels/*.xlsx
+FICHAS_SHEET_ID = os.getenv("FICHAS_SHEET_ID", "")
+
 
 def llm_factory(temperature: float = 0.3):
     """Single point of LLM instantiation for the whole project."""

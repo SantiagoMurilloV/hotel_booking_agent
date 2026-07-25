@@ -39,39 +39,42 @@ def _cell(v):
 
 # ------------------------------------------------------------------ sheets
 
-_spreadsheet = None
+_client = None
+_spreadsheets: dict[str, object] = {}
 
 
-def _open_spreadsheet():
-    global _spreadsheet
-    if _spreadsheet is None:
+def _open_spreadsheet(sheet_id: str = ""):
+    global _client
+    sheet_id = sheet_id or GOOGLE_SHEET_ID
+    if not sheet_id:
+        raise RuntimeError(
+            "STORAGE_BACKEND=sheets requires GOOGLE_SHEET_ID in .env")
+    if sheet_id not in _spreadsheets:
         import gspread
-        if not GOOGLE_SHEET_ID:
-            raise RuntimeError(
-                "STORAGE_BACKEND=sheets requires GOOGLE_SHEET_ID in .env")
-        key_path = Path(GOOGLE_SERVICE_ACCOUNT_KEY_PATH)
-        if not key_path.exists():
-            raise RuntimeError(
-                f"Service account key not found at {key_path}. Download the "
-                "JSON key from Google Cloud and point "
-                "GOOGLE_SERVICE_ACCOUNT_KEY_PATH to it.")
-        gc = gspread.service_account(filename=str(key_path))
-        _spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
-    return _spreadsheet
+        if _client is None:
+            key_path = Path(GOOGLE_SERVICE_ACCOUNT_KEY_PATH)
+            if not key_path.exists():
+                raise RuntimeError(
+                    f"Service account key not found at {key_path}. Download "
+                    "the JSON key from Google Cloud and point "
+                    "GOOGLE_SERVICE_ACCOUNT_KEY_PATH to it.")
+            _client = gspread.service_account(filename=str(key_path))
+        _spreadsheets[sheet_id] = _client.open_by_key(sheet_id)
+    return _spreadsheets[sheet_id]
 
 
-def _sheets_read(tab: str) -> pd.DataFrame:
+def _sheets_read(tab: str, sheet_id: str = "") -> pd.DataFrame:
     import gspread
     try:
-        ws = _open_spreadsheet().worksheet(tab)
+        ws = _open_spreadsheet(sheet_id).worksheet(tab)
     except gspread.WorksheetNotFound:
         return pd.DataFrame()
     return pd.DataFrame(ws.get_all_records())
 
 
-def _sheets_write(df: pd.DataFrame, tab: str) -> None:
+def _sheets_write(df: pd.DataFrame, tab: str, sheet_id: str = "") -> None:
     import gspread
-    ss = _open_spreadsheet()
+    ss = _open_spreadsheet(sheet_id)
     try:
         ws = ss.worksheet(tab)
     except gspread.WorksheetNotFound:
