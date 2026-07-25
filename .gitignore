@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+output/
+*.pyc
+service-account.json
+src/data/hotels/
+.DS_Store
