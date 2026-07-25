@@ -98,6 +98,35 @@ per-audience channels get split once the client creates the real webhooks.
 The tabs (`CRM_B2B`, `CRM_B2C`, `LEADS_GRUPOS`, `LEADS_<hotel>`) are created
 automatically the first time the bot writes.
 
+## Group-quote validation by the advisor
+
+When `ADVISOR_CHAT_ID` is set, group quotes are sent to that Telegram chat
+with inline buttons (approve / reject / adjust discount). Without it, the bot
+falls back to a console prompt when interactive, or auto-approves (with an
+audit note in the lead) on headless deploys. If the advisor doesn't answer
+within `ADVISOR_TIMEOUT_S` (default 600 s) the quote auto-approves so the
+client never hangs. Slack team notifications fire after the decision, as
+always. To find a chat id: message the bot and read the `chat_id` in the logs.
+
+## Deploy on Railway
+
+The bot uses long polling — no public URL or webhook needed, it runs as a
+plain worker process (`railway.toml` sets the start command).
+
+1. Railway → **New Project → Deploy from GitHub repo** → select this repo.
+2. **Variables** — set:
+   `LLM_PROVIDER`, `LLM_MODEL`, `DEEPSEEK_API_KEY`, `TELEGRAM_BOT_TOKEN`,
+   `STORAGE_BACKEND=sheets`, `GOOGLE_SHEET_ID`, `FICHAS_SHEET_ID`,
+   `GOOGLE_SERVICE_ACCOUNT_JSON` (paste the full JSON key content),
+   `ADVISOR_CHAT_ID`, `SLACK_WEBHOOK_URL` (optional),
+   `OUTPUT_DIR=/data/output`, `CHECKPOINT_DB=/data/checkpoints.sqlite`.
+3. **Volume** — attach one mounted at `/data` (PDFs, PMS mock and the
+   conversation checkpoints persist across deploys).
+4. Deploy and check the logs for `Application started`.
+
+Only one instance may poll a given bot token at a time — stop any local run
+before deploying (Telegram answers 409 Conflict otherwise).
+
 ## Tests
 
 ```bash

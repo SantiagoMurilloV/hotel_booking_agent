@@ -10,11 +10,13 @@ The other Excel files stay local on purpose: the hotel fichas técnicas
 sources that a later phase replaces with the real Cloudbeds API.
 """
 
+import json
 from pathlib import Path
 
 import pandas as pd
 
-from src.config.settings import (CRM_FILE, GOOGLE_SERVICE_ACCOUNT_KEY_PATH,
+from src.config.settings import (CRM_FILE, GOOGLE_SERVICE_ACCOUNT_JSON,
+                                 GOOGLE_SERVICE_ACCOUNT_KEY_PATH,
                                  GOOGLE_SHEET_ID, GROUP_LEADS_FILE,
                                  STORAGE_BACKEND)
 
@@ -52,13 +54,17 @@ def _open_spreadsheet(sheet_id: str = ""):
     if sheet_id not in _spreadsheets:
         import gspread
         if _client is None:
-            key_path = Path(GOOGLE_SERVICE_ACCOUNT_KEY_PATH)
-            if not key_path.exists():
-                raise RuntimeError(
-                    f"Service account key not found at {key_path}. Download "
-                    "the JSON key from Google Cloud and point "
-                    "GOOGLE_SERVICE_ACCOUNT_KEY_PATH to it.")
-            _client = gspread.service_account(filename=str(key_path))
+            if GOOGLE_SERVICE_ACCOUNT_JSON:
+                _client = gspread.service_account_from_dict(
+                    json.loads(GOOGLE_SERVICE_ACCOUNT_JSON))
+            else:
+                key_path = Path(GOOGLE_SERVICE_ACCOUNT_KEY_PATH)
+                if not key_path.exists():
+                    raise RuntimeError(
+                        f"Service account key not found at {key_path}. Set "
+                        "GOOGLE_SERVICE_ACCOUNT_JSON or point "
+                        "GOOGLE_SERVICE_ACCOUNT_KEY_PATH to the JSON key.")
+                _client = gspread.service_account(filename=str(key_path))
         _spreadsheets[sheet_id] = _client.open_by_key(sheet_id)
     return _spreadsheets[sheet_id]
 

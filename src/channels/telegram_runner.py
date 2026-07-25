@@ -4,29 +4,42 @@ Every Telegram chat maps to its own LangGraph thread (thread_id = chat id),
 so each user who writes to the bot gets an isolated conversation with its own
 state — no per-user setup needed: identity comes in every update payload.
 
-Group-quote validations (LangGraph interrupt) are answered by the Tasman
-advisor in THIS console, same UX as `python -m src.main`. While the advisor
-decides, the client sees a "estamos validando" message in Telegram.
+Group-quote validations (LangGraph interrupt) are resolved, in order of
+preference:
+1. ADVISOR_CHAT_ID set  -> sent to that Telegram chat with inline buttons
+   (approve / reject / adjust discount). Times out to auto-approve after
+   ADVISOR_TIMEOUT_S so the client never hangs.
+2. Interactive terminal -> console prompt (same UX as `python -m src.main`).
+3. Otherwise            -> auto-approve with an audit note (headless deploys
+   without an advisor configured).
+
+Conversations survive restarts via a SQLite checkpointer (CHECKPOINT_DB).
+Slack team notifications are untouched: they fire inside the graph nodes
+after the advisor's decision, exactly as in the console version.
 
 Run:  python -m src.channels.telegram_runner
 """
 
 import asyncio
 import html
+import itertools
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.types import Command
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
-from telegram.ext import (Application, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
 
-from src.config.settings import HOTELS_DIR, PROJECT_ROOT, TELEGRAM_BOT_TOKEN
+from src.config.settings import (ADVISOR_CHAT_ID, ADVISOR_TIMEOUT_S,
+                                 CHECKPOINT_DB, HOTELS_DIR, PROJECT_ROOT,
+                                 TELEGRAM_BOT_TOKEN)
 from src.main import _ask_advisor
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -44,16 +57,37 @@ WELCOME = (
 )
 
 _graph = None
-_advisor_lock = asyncio.Lock()   # one console validation at a time
+_advisor_lock = asyncio.Lock()            # one console validation at a time
+_chat_locks: dict[int, asyncio.Lock] = {} # per-chat message ordering
+_pending: dict[str, asyncio.Future] = {}  # validation id -> advisor decision
+_validation_ids = itertools.count(1)
 
 
 def _get_graph():
     global _graph
     if _graph is None:
         from src.orchestrator.graph import build_graph
-        _graph = build_graph()
+        checkpointer = None
+        try:
+            import sqlite3
+
+            from langgraph.checkpoint.sqlite import SqliteSaver
+            Path(CHECKPOINT_DB).parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(CHECKPOINT_DB, check_same_thread=False)
+            checkpointer = SqliteSaver(conn)
+            log.info("SQLite checkpointer: %s", CHECKPOINT_DB)
+        except ImportError:
+            log.warning("langgraph-checkpoint-sqlite not installed — "
+                        "conversations won't survive restarts")
+        _graph = build_graph(checkpointer)
     return _graph
 
+
+def _lock_for(chat_id: int) -> asyncio.Lock:
+    return _chat_locks.setdefault(chat_id, asyncio.Lock())
+
+
+# ------------------------------------------------------------- formatting
 
 def _text(content) -> str:
     """Normalize LLM message content (str or content-block list) to text."""
@@ -151,6 +185,94 @@ def _new_pdfs(messages: list) -> list[Path]:
     return pdfs
 
 
+# ------------------------------------------------- advisor validation flow
+
+def _format_validation(payload: dict) -> str:
+    lines = ["🔒 VALIDACIÓN — cotización de grupo", ""]
+    for key in ("hotel", "contacto", "empresa", "tipo_evento",
+                "habitaciones", "personas", "fechas", "room_type"):
+        lines.append(f"{key.replace('_', ' ').capitalize()}: {payload.get(key)}")
+    lines.append(f"OCC del hotel: {payload.get('occ_pct')}%")
+    lines.append(f"Dto. por OCC: {payload.get('descuento_pct')}%")
+    if payload.get("nota_direccion"):
+        lines.append(payload["nota_direccion"])
+    lines.append("")
+    lines.append("Cotización:")
+    for concepto, valor in payload.get("cotizacion", {}).items():
+        lines.append(f"  • {concepto.replace('_', ' ')}: {valor}")
+    return "\n".join(lines)
+
+
+async def _ask_advisor_telegram(bot, payload: dict) -> dict:
+    """Send the validation card to the advisor chat and await their tap."""
+    vid = f"v{next(_validation_ids)}"
+    fut = asyncio.get_running_loop().create_future()
+    _pending[vid] = fut
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Aprobar", callback_data=f"{vid}:aprobar"),
+         InlineKeyboardButton("❌ Rechazar", callback_data=f"{vid}:rechazar")],
+        [InlineKeyboardButton(f"✏️ dto {d}%", callback_data=f"{vid}:dto:{d}")
+         for d in (5, 10, 15, 20)],
+    ])
+    await bot.send_message(chat_id=ADVISOR_CHAT_ID,
+                           text=_format_validation(payload),
+                           reply_markup=keyboard)
+    log.info("🔒 Validación %s enviada al asesor (chat %s)", vid, ADVISOR_CHAT_ID)
+    try:
+        return await asyncio.wait_for(fut, timeout=ADVISOR_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        _pending.pop(vid, None)
+        log.warning("⏰ Validación %s sin respuesta — auto-aprobada", vid)
+        return {"decision": "aprobar",
+                "asesor": f"auto-aprobado (asesor sin responder en {ADVISOR_TIMEOUT_S}s)"}
+
+
+async def on_advisor_decision(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    vid, _, action = query.data.partition(":")
+    fut = _pending.pop(vid, None)
+    if fut is None or fut.done():
+        await query.answer("Esta validación ya fue resuelta.")
+        return
+
+    asesor = query.from_user.first_name or "Asesor Tasman"
+    if action == "aprobar":
+        decision = {"decision": "aprobar", "asesor": f"{asesor} (Telegram)"}
+        label = "✅ Aprobada"
+    elif action == "rechazar":
+        decision = {"decision": "rechazar", "nota": "rechazado por asesor",
+                    "asesor": f"{asesor} (Telegram)"}
+        label = "❌ Rechazada"
+    else:  # dto:<n>
+        pct = float(action.split(":")[1])
+        decision = {"decision": "ajustar", "descuento": pct,
+                    "asesor": f"{asesor} (Telegram)",
+                    "nota": f"Descuento ajustado a {pct:.0f}%"}
+        label = f"✏️ Descuento ajustado a {pct:.0f}%"
+
+    fut.set_result(decision)
+    await query.answer("Decisión registrada")
+    try:
+        await query.edit_message_text(
+            f"{query.message.text}\n\n➡️ {label} por {asesor}")
+    except BadRequest:
+        pass
+    log.info("🔒 Validación %s: %s por %s", vid, label, asesor)
+
+
+async def _resolve_interrupt(bot, payload: dict) -> dict:
+    if ADVISOR_CHAT_ID:
+        return await _ask_advisor_telegram(bot, payload)
+    if sys.stdin.isatty():
+        async with _advisor_lock:
+            return await asyncio.to_thread(_ask_advisor, payload)
+    log.warning("Sin ADVISOR_CHAT_ID ni consola — cotización auto-aprobada")
+    return {"decision": "aprobar", "asesor": "auto-aprobado (sin asesor configurado)"}
+
+
+# ------------------------------------------------------------- handlers
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = f", {user.first_name}" if user and user.first_name else ""
@@ -168,43 +290,44 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     config = {"configurable": {"thread_id": f"tg-{chat_id}"}}
     graph = _get_graph()
 
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    try:
-        result = await asyncio.to_thread(
-            graph.invoke, {"messages": [HumanMessage(content=text)]}, config)
-
-        while result.get("__interrupt__"):
-            await update.message.reply_text(
-                "⏳ Un momento por favor — un asesor Tasman está validando tu "
-                "cotización de grupo...")
-            async with _advisor_lock:
-                decision = await asyncio.to_thread(
-                    _ask_advisor, result["__interrupt__"][0].value)
-            await context.bot.send_chat_action(chat_id=chat_id,
-                                               action=ChatAction.TYPING)
-            result = await asyncio.to_thread(
-                graph.invoke, Command(resume=decision), config)
-    except Exception:
-        log.exception("Error procesando mensaje de chat_id=%s", chat_id)
-        await update.message.reply_text(
-            "Lo siento, tuve un problema técnico procesando tu mensaje. "
-            "¿Puedes intentarlo de nuevo?")
-        return
-
-    reply = _text(result["messages"][-1].content).strip()
-    log.info("📤 [%s] %s", chat_id, reply[:200])
-    for chunk in _split(reply or "..."):
-        await _reply(update, chunk)
-
-    # Attach any quote PDF generated during this turn
-    for pdf in _new_pdfs(result["messages"]):
+    async with _lock_for(chat_id):
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         try:
-            await context.bot.send_document(chat_id=chat_id, document=pdf.open("rb"),
-                                            filename=pdf.name,
-                                            caption="📄 Tu cotización Tasman")
-            log.info("📎 [%s] PDF enviado: %s", chat_id, pdf.name)
+            result = await asyncio.to_thread(
+                graph.invoke, {"messages": [HumanMessage(content=text)]}, config)
+
+            while result.get("__interrupt__"):
+                await update.message.reply_text(
+                    "⏳ Un momento por favor — un asesor Tasman está validando tu "
+                    "cotización de grupo...")
+                decision = await _resolve_interrupt(
+                    context.bot, result["__interrupt__"][0].value)
+                await context.bot.send_chat_action(chat_id=chat_id,
+                                                   action=ChatAction.TYPING)
+                result = await asyncio.to_thread(
+                    graph.invoke, Command(resume=decision), config)
         except Exception:
-            log.exception("No se pudo enviar el PDF %s", pdf)
+            log.exception("Error procesando mensaje de chat_id=%s", chat_id)
+            await update.message.reply_text(
+                "Lo siento, tuve un problema técnico procesando tu mensaje. "
+                "¿Puedes intentarlo de nuevo?")
+            return
+
+        reply = _text(result["messages"][-1].content).strip()
+        log.info("📤 [%s] %s", chat_id, reply[:200])
+        for chunk in _split(reply or "..."):
+            await _reply(update, chunk)
+
+        # Attach any quote PDF generated during this turn
+        for pdf in _new_pdfs(result["messages"]):
+            try:
+                await context.bot.send_document(chat_id=chat_id,
+                                                document=pdf.open("rb"),
+                                                filename=pdf.name,
+                                                caption="📄 Tu cotización Tasman")
+                log.info("📎 [%s] PDF enviado: %s", chat_id, pdf.name)
+            except Exception:
+                log.exception("No se pudo enviar el PDF %s", pdf)
 
 
 async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,14 +348,21 @@ def main() -> None:
 
     _get_graph()  # build once at startup (fail fast if LLM config is wrong)
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (Application.builder()
+           .token(TELEGRAM_BOT_TOKEN)
+           .concurrent_updates(True)   # advisor taps must not wait behind chats
+           .build())
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_advisor_decision))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(MessageHandler(~filters.TEXT, on_other))
 
     print("=" * 60)
     print("  TASMAN — Bot de ventas · canal Telegram (long polling)")
-    print("  Las validaciones de grupo se responden en ESTA consola.")
+    if ADVISOR_CHAT_ID:
+        print(f"  Validaciones de grupo → Telegram chat {ADVISOR_CHAT_ID}")
+    else:
+        print("  Validaciones de grupo → esta consola (o auto si headless)")
     print("  Ctrl+C para detener.")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

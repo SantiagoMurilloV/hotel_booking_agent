@@ -11,7 +11,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 DATA_DIR = PROJECT_ROOT / "src" / "data"
 HOTELS_DIR = DATA_DIR / "hotels"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+# Overridable so deploys can point it to a persistent volume (e.g. /data/output)
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", PROJECT_ROOT / "output"))
 LEADS_DIR = OUTPUT_DIR / "leads"
 QUOTES_DIR = OUTPUT_DIR / "cotizaciones"
 
@@ -70,6 +71,18 @@ GOOGLE_SERVICE_ACCOUNT_KEY_PATH = os.getenv(
 # Hotel fact sheets (rates, rooms, policies, upsells): when set, they are read
 # from this Google Sheet instead of src/data/hotels/*.xlsx
 FICHAS_SHEET_ID = os.getenv("FICHAS_SHEET_ID", "")
+
+# Service account credentials as inline JSON (for deploys without a key file).
+# Takes precedence over GOOGLE_SERVICE_ACCOUNT_KEY_PATH when set.
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+
+# Telegram chat that validates group quotes (inline buttons). Empty -> console
+# prompt when running interactively, auto-approve otherwise.
+ADVISOR_CHAT_ID = os.getenv("ADVISOR_CHAT_ID", "")
+ADVISOR_TIMEOUT_S = int(os.getenv("ADVISOR_TIMEOUT_S", "600"))
+
+# LangGraph checkpointer database (conversations survive restarts)
+CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", str(OUTPUT_DIR / "checkpoints.sqlite"))
 
 
 def llm_factory(temperature: float = 0.3):
