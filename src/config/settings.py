@@ -62,6 +62,15 @@ LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
+# WhatsApp via Kapso (https://kapso.ai): sandbox for local testing, real
+# number in production. The API mirrors Meta's Cloud API payloads.
+KAPSO_API_KEY = os.getenv("KAPSO_API_KEY", "")
+KAPSO_PHONE_NUMBER_ID = os.getenv("KAPSO_PHONE_NUMBER_ID", "")
+KAPSO_WEBHOOK_SECRET = os.getenv("KAPSO_WEBHOOK_SECRET", "")
+KAPSO_API_BASE = os.getenv("KAPSO_API_BASE",
+                           "https://api.kapso.ai/meta/whatsapp/v24.0")
+WHATSAPP_PORT = int(os.getenv("WHATSAPP_PORT", "8000"))
+
 # LEADS/CRM storage: "excel" (local files) or "sheets" (Google Sheets)
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "excel")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")

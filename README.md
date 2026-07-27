@@ -2,9 +2,10 @@
 
 Conversational sales bot (LangGraph) for the **TASMAN** hotel group (6 hotels),
 implementing the Sales Direction *2026 Sales Flow*: **the bot quotes instantly,
-the human negotiates and closes**. Current channels: **Telegram** (long polling)
-and console; WhatsApp Cloud API plugs in later on top of the same graph.
-LEADS/CRM storage is switchable between local Excel and **Google Sheets**.
+the human negotiates and closes**. Current channels: **Telegram** (long
+polling), **WhatsApp** via [Kapso](https://kapso.ai) (webhooks) and console —
+all on top of the same graph. LEADS/CRM storage is switchable between local
+Excel and **Google Sheets**.
 
 ## Implemented flows
 
@@ -28,7 +29,10 @@ LEADS/CRM storage is switchable between local Excel and **Google Sheets**.
 ```
 src/
 ├── main.py                     # Console chat (client + advisor validation)
-├── channels/telegram_runner.py # Telegram channel: 1 chat = 1 graph thread
+├── channels/
+│   ├── common.py               # Shared channel plumbing (graph, formatting, PDFs)
+│   ├── telegram_runner.py      # Telegram channel: 1 chat = 1 graph thread
+│   └── whatsapp_runner.py      # WhatsApp channel via Kapso: 1 phone = 1 thread
 ├── config/settings.py          # MXN, 16% VAT, hotels, group policy, llm_factory
 ├── orchestrator/graph.py       # LangGraph: chat ↔ tools + 3 intercepted pipelines
 ├── agents/concierge_agent.py   # Multi-hotel sales agent prompt
@@ -75,11 +79,42 @@ python -m src.data.generate_tasman_data
 
 ```bash
 python -m src.channels.telegram_runner # Telegram bot (requires TELEGRAM_BOT_TOKEN)
+python -m src.channels.whatsapp_runner # WhatsApp bot via Kapso (see section below)
 python -m src.main                     # console chat (+ advisor console on groups)
 python -m src.cli.vip_lead             # flow C: VIP capture by the advisor
 python -m src.jobs.run_followups       # pending follow-ups (1/3/5 days)
 python -m src.jobs.run_reports todos   # kpis | directivo | operativo | todos
 ```
+
+## WhatsApp via Kapso (local testing with the sandbox)
+
+[Kapso](https://kapso.ai) wraps Meta's WhatsApp Cloud API (REST + webhooks);
+its sandbox lets you chat with the bot from your own phone without a Meta
+Business account. One-time setup:
+
+1. Kapso dashboard → **WhatsApp → Sandbox → Add Test Number**: register your
+   phone and send the 6-char activation code to the sandbox number.
+2. Put the API key and the sandbox **phone number id** in `.env`
+   (`KAPSO_API_KEY`, `KAPSO_PHONE_NUMBER_ID`).
+3. Start the webhook server and expose it with a tunnel:
+
+   ```bash
+   python -m src.channels.whatsapp_runner   # listens on :8000
+   ngrok http 8000                          # or: cloudflared tunnel --url http://localhost:8000
+   ```
+
+4. Sandbox → **Manage Webhooks**: register
+   `https://<tunnel>/kapso/webhook` for the `whatsapp.message.received`
+   event. If you set a webhook secret, mirror it in `KAPSO_WEBHOOK_SECRET`
+   (empty = signature check disabled, fine for local).
+
+Now message the sandbox number: 1 phone = 1 graph thread (`wa-<phone>`).
+Group-quote validations fall back to the runner's console (or auto-approve
+when headless). Sandbox limits: text/interactive messages only and a single
+test recipient — quote PDFs degrade to a text notice if the upload fails,
+and templates are unavailable until a real number is connected. Avoid running
+Telegram and WhatsApp runners against the same `CHECKPOINT_DB` concurrently
+(SQLite single-writer).
 
 Without `SLACK_WEBHOOK_URL` (or if the webhook fails) notifications are printed
 to the console. Note: an incoming webhook posts to one fixed channel; the

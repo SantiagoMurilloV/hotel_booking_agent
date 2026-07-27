@@ -23,13 +23,11 @@ Run:  python -m src.channels.telegram_runner
 import asyncio
 import html
 import itertools
-import json
 import logging
 import re
 import sys
-from pathlib import Path
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
@@ -37,9 +35,10 @@ from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
+from src.channels.common import (get_graph, new_pdfs, split_text,
+                                 tables_to_lines, text_content)
 from src.config.settings import (ADVISOR_CHAT_ID, ADVISOR_TIMEOUT_S,
-                                 CHECKPOINT_DB, HOTELS_DIR, PROJECT_ROOT,
-                                 TELEGRAM_BOT_TOKEN)
+                                 HOTELS_DIR, TELEGRAM_BOT_TOKEN)
 from src.main import _ask_advisor
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -56,31 +55,10 @@ WELCOME = (
     "grupos y eventos al instante."
 )
 
-_graph = None
 _advisor_lock = asyncio.Lock()            # one console validation at a time
 _chat_locks: dict[int, asyncio.Lock] = {} # per-chat message ordering
 _pending: dict[str, asyncio.Future] = {}  # validation id -> advisor decision
 _validation_ids = itertools.count(1)
-
-
-def _get_graph():
-    global _graph
-    if _graph is None:
-        from src.orchestrator.graph import build_graph
-        checkpointer = None
-        try:
-            import sqlite3
-
-            from langgraph.checkpoint.sqlite import SqliteSaver
-            Path(CHECKPOINT_DB).parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(CHECKPOINT_DB, check_same_thread=False)
-            checkpointer = SqliteSaver(conn)
-            log.info("SQLite checkpointer: %s", CHECKPOINT_DB)
-        except ImportError:
-            log.warning("langgraph-checkpoint-sqlite not installed — "
-                        "conversations won't survive restarts")
-        _graph = build_graph(checkpointer)
-    return _graph
 
 
 def _lock_for(chat_id: int) -> asyncio.Lock:
@@ -89,40 +67,9 @@ def _lock_for(chat_id: int) -> asyncio.Lock:
 
 # ------------------------------------------------------------- formatting
 
-def _text(content) -> str:
-    """Normalize LLM message content (str or content-block list) to text."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            b.get("text", "") if isinstance(b, dict) else str(b)
-            for b in content
-        ).strip()
-    return str(content)
-
-
-def _tables_to_lines(text: str) -> str:
-    """Telegram has no tables: flatten '| Concepto | Monto |' rows to lines."""
-    out = []
-    for line in text.split("\n"):
-        s = line.strip()
-        if s.startswith("|") and s.endswith("|") and s.count("|") >= 2:
-            cells = [c.strip() for c in s.strip("|").split("|")]
-            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
-                continue  # separator row |---|---|
-            cells = [c for c in cells if c]
-            if len(cells) == 2:
-                out.append(f"{cells[0]}: {cells[1]}")
-            else:
-                out.append(" · ".join(cells))
-        else:
-            out.append(line)
-    return "\n".join(out)
-
-
 def _md_to_telegram_html(text: str) -> str:
     """Render the LLM's markdown as Telegram HTML (bold/italic/code/bullets)."""
-    text = _tables_to_lines(text)
+    text = tables_to_lines(text)
     text = re.sub(r"^\s*([-_*])\1{2,}\s*$", "", text, flags=re.MULTILINE)  # --- hr
     text = html.escape(text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
@@ -145,44 +92,6 @@ async def _reply(update: Update, chunk: str) -> None:
                                         parse_mode=ParseMode.HTML)
     except BadRequest:
         await update.message.reply_text(chunk)
-
-
-def _split(text: str) -> list[str]:
-    """Split a reply into Telegram-sized chunks, preferring newline breaks."""
-    chunks = []
-    while len(text) > TELEGRAM_MAX_LEN:
-        cut = text.rfind("\n", 0, TELEGRAM_MAX_LEN)
-        if cut < TELEGRAM_MAX_LEN // 2:
-            cut = TELEGRAM_MAX_LEN
-        chunks.append(text[:cut].rstrip())
-        text = text[cut:].lstrip()
-    if text:
-        chunks.append(text)
-    return chunks
-
-
-def _new_pdfs(messages: list) -> list[Path]:
-    """PDF paths produced by tools during the last turn (after the last human msg)."""
-    last_human = 0
-    for i, m in enumerate(messages):
-        if isinstance(m, HumanMessage):
-            last_human = i
-    pdfs = []
-    for m in messages[last_human:]:
-        if not isinstance(m, ToolMessage):
-            continue
-        try:
-            payload = json.loads(_text(m.content))
-        except (json.JSONDecodeError, TypeError):
-            continue
-        pdf = payload.get("pdf") if isinstance(payload, dict) else None
-        if pdf:
-            path = Path(pdf)
-            if not path.is_absolute():
-                path = PROJECT_ROOT / path
-            if path.exists():
-                pdfs.append(path)
-    return pdfs
 
 
 # ------------------------------------------------- advisor validation flow
@@ -288,7 +197,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     log.info("📥 [%s | %s] %s", chat_id, user.first_name if user else "?", text)
 
     config = {"configurable": {"thread_id": f"tg-{chat_id}"}}
-    graph = _get_graph()
+    graph = get_graph()
 
     async with _lock_for(chat_id):
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -313,13 +222,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 "¿Puedes intentarlo de nuevo?")
             return
 
-        reply = _text(result["messages"][-1].content).strip()
+        reply = text_content(result["messages"][-1].content).strip()
         log.info("📤 [%s] %s", chat_id, reply[:200])
-        for chunk in _split(reply or "..."):
+        for chunk in split_text(reply or "...", TELEGRAM_MAX_LEN):
             await _reply(update, chunk)
 
         # Attach any quote PDF generated during this turn
-        for pdf in _new_pdfs(result["messages"]):
+        for pdf in new_pdfs(result["messages"]):
             try:
                 await context.bot.send_document(chat_id=chat_id,
                                                 document=pdf.open("rb"),
@@ -346,7 +255,7 @@ def main() -> None:
         from src.data.generate_tasman_data import main as generate_data
         generate_data()
 
-    _get_graph()  # build once at startup (fail fast if LLM config is wrong)
+    get_graph()  # build once at startup (fail fast if LLM config is wrong)
 
     app = (Application.builder()
            .token(TELEGRAM_BOT_TOKEN)
