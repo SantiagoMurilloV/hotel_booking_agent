@@ -254,6 +254,8 @@ async def health() -> dict:
 
 
 @app.post("/kapso/webhook")
+@app.post("/webhook")   # aliases: accept the URL however it was registered
+@app.post("/")
 async def kapso_webhook(request: Request) -> Response:
     raw = await request.body()
     if not _signature_ok(raw, request.headers.get("X-Webhook-Signature")):
@@ -290,8 +292,9 @@ def main() -> None:
 
     print("=" * 60)
     print("  TASMAN — Bot de ventas · canal WhatsApp (Kapso webhooks)")
-    print(f"  Escuchando en http://0.0.0.0:{WHATSAPP_PORT}/kapso/webhook")
-    print("  Exponlo con:  ngrok http " + str(WHATSAPP_PORT))
+    print(f"  Escuchando en http://0.0.0.0:{WHATSAPP_PORT} "
+          "(webhook en /kapso/webhook, /webhook o /)")
+    print(f"  Exponlo con:  cloudflared tunnel --url http://localhost:{WHATSAPP_PORT}")
     if KAPSO_WEBHOOK_SECRET:
         print("  Verificación de firma: activada")
     else:
